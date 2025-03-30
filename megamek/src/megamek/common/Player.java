@@ -614,39 +614,47 @@ public final class Player extends TurnOrdered {
         if (game == null) {
             return 0;
         }
+
         int commandb = 0;
+        boolean useCommandInit = game.getOptions().booleanOption(OptionsConstants.RPG_COMMAND_INIT);
+
         for (InGameObject unit : game.getInGameObjects()) {
-            if (unit instanceof Entity) {
-                Entity entity = (Entity) unit;
-                boolean useCommandInit = game.getOptions().booleanOption(OptionsConstants.RPG_COMMAND_INIT);
-                boolean checkThisTurn = ((null != entity.getOwner())
-                      && entity.getOwner().equals(this)
-                      && !entity.isDestroyed()
-                      && entity.getCrew().isActive()
-                      && !entity.isCaptured()
-                      && !(entity instanceof MekWarrior))
-                      && ((entity.isDeployed() && !entity.isOffBoard()) || (entity.getDeployRound() == (game.getCurrentRound() + 1)));
-                if (checkThisTurn) {
-                    int bonus = 0;
-                    if (useCommandInit) {
-                        bonus = entity.getCrew().getCommandBonus();
-                    }
-                    //Even if the RPG option is not enabled, we still get the command bonus provided by special equipment.
-                    //Since we are not designating a single force commander at this point, we assume a superheavy tripod
-                    //is the force commander if that gives the highest bonus.
-                    if (entity.hasCommandConsoleBonus() || entity.getCrew().hasActiveTechOfficer()) {
-                        bonus += 2;
-                    }
-                    //Once we've gotten the status of the command console (if any), reset the flag that tracks
-                    //the previous turn's action.
-                    if (bonus > commandb) {
-                        commandb = bonus;
-                    }
-                }
+            if (!(unit instanceof Entity entity)) {
+                continue;
             }
+
+            if (!isEligibleEntity(entity)) {
+                continue;
+            }
+
+            int bonus = calculateBonus(entity, useCommandInit);
+            commandb = Math.max(commandb, bonus);
         }
+
         return commandb;
     }
+
+    private boolean isEligibleEntity(Entity entity) {
+        return entity.getOwner() != null &&
+              entity.getOwner().equals(this) &&
+              !entity.isDestroyed() &&
+              entity.getCrew().isActive() &&
+              !entity.isCaptured() &&
+              !(entity instanceof MekWarrior) &&
+              (entity.isDeployed() && !entity.isOffBoard() ||
+                    entity.getDeployRound() == game.getCurrentRound() + 1);
+    }
+
+    private int calculateBonus(Entity entity, boolean useCommandInit) {
+        int bonus = useCommandInit ? entity.getCrew().getCommandBonus() : 0;
+
+        if (entity.hasCommandConsoleBonus() || entity.getCrew().hasActiveTechOfficer()) {
+            bonus += 2;
+        }
+
+        return bonus;
+    }
+
 
     public String getColorForPlayer() {
         return "<B><font color='" + getColour().getHexString(0x00F0F0F0) + "'>" + getName() + "</font></B>";
