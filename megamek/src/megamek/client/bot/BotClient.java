@@ -91,11 +91,12 @@ public abstract class BotClient extends Client {
 
     public BotClient(String playerName, String host, int port) {
         super(playerName, host, port);
-
         boardClusterTracker = new BoardClusterTracker();
+        initializeListeners();
+    }
 
+    private void initializeListeners() {
         game.addGameListener(new GameListenerAdapter() {
-
             @Override
             public void gamePlayerChat(GamePlayerChatEvent e) {
                 processChat(e);
@@ -104,102 +105,46 @@ public abstract class BotClient extends Client {
 
             @Override
             public void gameTurnChange(GameTurnChangeEvent e) {
-                // On simultaneous phases, each player ending their turn will generate a turn
-                // change
-                // We want to ignore turns from other players and only listen to events we
-                // generated
-                boolean ignoreSimTurn = getGame().getPhase().isSimultaneous(getGame())
-                        && (e.getPreviousPlayerId() != localPlayerNumber)
-                        && calculatedTurnThisPhase;
-
-                if (isMyTurn() && !ignoreSimTurn) {
-                    calculatedTurnThisPhase = true;
-                    // Run bot's turn processing in a separate thread.
-                    // So calling thread is free to process the other actions.
-                    Thread worker = new Thread(new CalculateBotTurn(),
-                            getName() + " Turn " + game.getTurnIndex() + " Calc Thread");
-                    worker.start();
-                    calculatedTurnsThisPhase++;
-                }
-
-                // unloading "stranded" units happens as part of a game turn change, so that's
-                // where we do it.
-                if (canUnloadStranded()) {
-                    sendUnloadStranded(getStrandedEntities());
-                }
+                handleGameTurnChange(e);
             }
 
             @Override
             public void gamePhaseChange(GamePhaseChangeEvent e) {
-                calculatedTurnThisPhase = false;
-                if (e.getOldPhase().isSimultaneous(getGame())) {
-                    logger.info(
-                        String.format("%s: Calculated %d / %d turns for phase %s",
-                            getName(), calculatedTurnsThisPhase,
-                            getGame().getEntitiesOwnedBy(getLocalPlayer()), e.getOldPhase()
-                        )
-                    );
-                }
-                calculatedTurnsThisPhase = 0;
+                handleGamePhaseChange(e);
             }
 
             @Override
             public void gameReport(GameReportEvent e) {
                 if (game.getPhase().isInitiativeReport()) {
-                    // Opponent has used tactical genius, must press
-                    // "Done" again to advance past initiative report.
                     sendDone(true);
                     flushConn();
                 }
             }
-
-            @Override
-            public void gameClientFeedbackRequest(GameCFREvent evt) {
-                switch (evt.getCFRType()) {
-                    case CFR_DOMINO_EFFECT:
-                        // This will always send a "no action" response.
-                        // In effect, it works the way it did before. However..
-                        // TODO: Bots should figure out how to step out of a domino effect
-                        sendDominoCFRResponse(null);
-                        break;
-                    case CFR_AMS_ASSIGN:
-                        // Picks the WAA with the highest expected damage,
-                        // essentially same as if the auto_ams option was on
-                        WeaponAttackAction waa = Compute.getHighestExpectedDamage(game, evt.getWAAs(), true);
-                        sendAMSAssignCFRResponse(evt.getWAAs().indexOf(waa));
-                        break;
-                    case CFR_APDS_ASSIGN:
-                        // Picks the WAA with the highest expected damage,
-                        // essentially same as if the auto_ams option was on
-                        waa = Compute.getHighestExpectedDamage(game, evt.getWAAs(), true);
-                        sendAPDSAssignCFRResponse(evt.getWAAs().indexOf(waa));
-                        break;
-                    case CFR_HIDDEN_PBS:
-                        try {
-                            Vector<EntityAction> pointBlankShots = calculatePointBlankShot(evt.getEntityId(),
-                                    evt.getTargetId());
-
-                            if (pointBlankShots.isEmpty()) {
-                                sendHiddenPBSCFRResponse(null);
-                            } else {
-                                // we send two packets because the server will ignore the first one
-                                sendHiddenPBSCFRResponse(new Vector<>());
-                                sendHiddenPBSCFRResponse(pointBlankShots);
-                            }
-                        } catch (Exception ex) {
-                            // if we screw up, don't keep everyone else waiting
-                            sendHiddenPBSCFRResponse(null);
-                            throw ex;
-                        }
-                        break;
-                    case CFR_TAG_TARGET:
-                        sendTAGTargetCFRResponse(pickTagTarget(evt));
-                        break;
-                    default:
-                        break;
-                }
-            }
         });
+    }
+
+    private void handleGameTurnChange(GameTurnChangeEvent e) {
+        boolean ignoreSimTurn = getGame().getPhase().isSimultaneous(getGame()) &&
+              (e.getPreviousPlayerId() != localPlayerNumber) &&
+              calculatedTurnThisPhase;
+        if (isMyTurn() && !ignoreSimTurn) {
+            calculatedTurnThisPhase = true;
+            new Thread(new CalculateBotTurn(), getName() + " Turn " + game.getTurnIndex() + " Calc Thread").start();
+            calculatedTurnsThisPhase++;
+        }
+        if (canUnloadStranded()) {
+            sendUnloadStranded(getStrandedEntities());
+        }
+    }
+
+    private void handleGamePhaseChange(GamePhaseChangeEvent e) {
+        calculatedTurnThisPhase = false;
+        if (e.getOldPhase().isSimultaneous(getGame())) {
+            logger.info(String.format("%s: Calculated %d / %d turns for phase %s", getName(),
+                  calculatedTurnsThisPhase, getGame().getEntitiesOwnedBy(getLocalPlayer()),
+                  e.getOldPhase()));
+        }
+        calculatedTurnsThisPhase = 0;
     }
 
     @Override
@@ -243,7 +188,7 @@ public abstract class BotClient extends Client {
      */
     protected void calculateTargetingOffBoardTurn() {
         sendAttackData(game.getFirstEntityNum(getMyTurn()),
-                new Vector<>(0));
+              new Vector<>(0));
         sendDone(true);
     }
 
@@ -293,43 +238,39 @@ public abstract class BotClient extends Client {
      *
      * @return Array of entity IDs.
      */
+
     public int[] getStrandedEntities() {
-        List<Integer> entitiesToUnload = new ArrayList<>();
+        return game.getPlayerEntities(getLocalPlayer(), true).stream()
+              .filter(entity -> isStranded(entity))
+              .mapToInt(Entity::getId)
+              .toArray();
+    }
 
-        // Basically, we loop through all entities owned by the current player
-        // And if the entity happens to be in a disabled transport, then we unload it
-        // unless doing so would kill it or be illegal due to stacking violation
-        for (Entity currentEntity : getGame().getPlayerEntities(getLocalPlayer(), true)) {
-            Entity transport = currentEntity.getTransportId() != Entity.NONE
-                    ? getGame().getEntity(currentEntity.getTransportId())
-                    : null;
+    private boolean isStranded(Entity entity) {
+        Entity transport = getTransportEntity(entity);
+        return transport != null && transport.isPermanentlyImmobilized(true) &&
+              !hasStackingViolation(entity, transport) && !isUnloadFatal(entity, transport);
+    }
 
-            if (transport != null && transport.isPermanentlyImmobilized(true)) {
-                boolean stackingViolation = null != Compute.stackingViolation(game, currentEntity.getId(),
-                        transport.getPosition(), currentEntity.climbMode());
-                boolean unloadFatal = currentEntity.isBoardProhibited(getGame().getBoard().getType())
-                        || currentEntity.isLocationProhibited(transport.getPosition())
-                        || currentEntity.isLocationDeadly(transport.getPosition());
+    private Entity getTransportEntity(Entity entity) {
+        return entity.getTransportId() != Entity.NONE ? game.getEntity(entity.getTransportId()) : null;
+    }
 
-                if (!stackingViolation && !unloadFatal) {
-                    entitiesToUnload.add(currentEntity.getId());
-                }
-            }
-        }
+    private boolean hasStackingViolation(Entity entity, Entity transport) {
+        return Compute.stackingViolation(game, entity.getId(), transport.getPosition(), entity.climbMode()) != null;
+    }
 
-        int[] entityIDs = new int[entitiesToUnload.size()];
-        for (int x = 0; x < entitiesToUnload.size(); x++) {
-            entityIDs[x] = entitiesToUnload.get(x);
-        }
-
-        return entityIDs;
+    private boolean isUnloadFatal(Entity entity, Entity transport) {
+        return entity.isBoardProhibited(game.getBoard().getType()) ||
+              entity.isLocationProhibited(transport.getPosition()) ||
+              entity.isLocationDeadly(transport.getPosition());
     }
 
     public List<Entity> getEntitiesOwned() {
         ArrayList<Entity> result = new ArrayList<>();
         for (Entity entity : game.getEntitiesVector()) {
             if (entity.getOwner().equals(getLocalPlayer())
-                    && (entity.getPosition() != null) && !entity.isOffBoard()) {
+                  && (entity.getPosition() != null) && !entity.isOffBoard()) {
                 result.add(entity);
             }
         }
@@ -356,9 +297,9 @@ public abstract class BotClient extends Client {
             currentTurnEnemyEntities = new ArrayList<>();
             for (Entity entity : game.getEntitiesVector()) {
                 if (entity.getOwner().isEnemyOf(getLocalPlayer())
-                    && (entity.getPosition() != null) && !entity.isOffBoard()
-                    && (entity.getCrew() != null) && !entity.getCrew().isDead()
-                    && !entity.isHidden()) {
+                      && (entity.getPosition() != null) && !entity.isOffBoard()
+                      && (entity.getCrew() != null) && !entity.getCrew().isDead()
+                      && !entity.isHidden()) {
                     currentTurnEnemyEntities.add(entity);
                 }
             }
@@ -377,7 +318,7 @@ public abstract class BotClient extends Client {
             currentTurnFriendlyEntities = new ArrayList<>();
             for (Entity entity : game.getEntitiesVector()) {
                 if (!entity.getOwner().isEnemyOf(getLocalPlayer()) && (entity.getPosition() != null)
-                        && !entity.isOffBoard()) {
+                      && !entity.isOffBoard()) {
                     currentTurnFriendlyEntities.add(entity);
                 }
             }
@@ -390,84 +331,45 @@ public abstract class BotClient extends Client {
     @Override
     public void changePhase(GamePhase phase) {
         super.changePhase(phase);
-
         try {
             switch (phase) {
-                case LOUNGE:
-                    sendChat(Messages.getString("BotClient.Hi"));
-                    break;
-                case DEPLOY_MINEFIELDS:
-                    deployMinefields();
-                    break;
-                case DEPLOYMENT:
-                    initialize();
-                    break;
-                case PREMOVEMENT:
-                    break;
-                case MOVEMENT:
-                    /*
-                     * Do not uncomment this. It is so that bots stick around till end of game
-                     * for proper salvage. If the bot dies out here, the salvage for all but the
-                     * last bot disappears for some reason
-                     * if (game.getEntitiesOwnedBy(getLocalPlayer()) == 0) {
-                     * sendChat(Messages.getString("BotClient.HowAbout"));
-                     * die();
-                     * }
-                     */
-                    // if the game is not double blind and I can't see anyone
-                    // else on the board I should kill myself.
-                    if (!(game.getOptions().booleanOption(OptionsConstants.ADVANCED_DOUBLE_BLIND))
-                            && ((game.getEntitiesOwnedBy(getLocalPlayer())
-                                    - game.getNoOfEntities()) == 0)) {
-                        die();
-                    }
-
-                    if (Compute.randomInt(4) == 1) {
-                        String message = getRandomBotMessage();
-                        if (message != null) {
-                            sendChat(message);
-                        }
-                    }
-                    initMovement();
-                    break;
-                case PREFIRING:
-                    break;
-                case FIRING:
-                    postMovementProcessing();
-                    initFiring();
-                    break;
-                case PHYSICAL:
-                    break;
-                case TARGETING:
-                    initTargeting();
-                    break;
-                case END_REPORT:
-                    // Check if stealth armor should be switched on/off
-                    // Kinda cheap leaving this until the end phase, players
-                    // can't do this
-                    toggleStealth();
-                    endOfTurnProcessing();
-                    // intentional fallthrough: all reports must click "done", otherwise the game
-                    // never moves on.
-                case TARGETING_REPORT:
-                case INITIATIVE_REPORT:
-                case MOVEMENT_REPORT:
-                case OFFBOARD_REPORT:
-                case FIRING_REPORT:
-                case PHYSICAL_REPORT:
-                    sendDone(true);
-                    break;
-                case VICTORY:
-                    runEndGame();
-                    sendChat(Messages.getString("BotClient.Bye"));
-                    die();
-                    break;
-                default:
-                    break;
+                case LOUNGE -> sendChat(Messages.getString("BotClient.Hi"));
+                case DEPLOY_MINEFIELDS -> deployMinefields();
+                case DEPLOYMENT -> initialize();
+                case MOVEMENT -> handleMovementPhaseStart();
+                case FIRING -> handleFiringPhaseStart();
+                case TARGETING -> initTargeting();
+                case END_REPORT, TARGETING_REPORT, INITIATIVE_REPORT, MOVEMENT_REPORT,
+                      OFFBOARD_REPORT, FIRING_REPORT, PHYSICAL_REPORT -> sendDone(true);
+                case VICTORY -> handleVictoryPhase();
+                default -> {}
             }
         } catch (Throwable t) {
             logger.error(t, "changePhase");
         }
+    }
+
+    private void handleMovementPhaseStart() {
+        if (!game.getOptions().booleanOption(OptionsConstants.ADVANCED_DOUBLE_BLIND) &&
+              (game.getEntitiesOwnedBy(getLocalPlayer()) - game.getNoOfEntities()) == 0) {
+            die();
+        }
+        if (Compute.randomInt(4) == 1) {
+            String message = getRandomBotMessage();
+            if (message != null) sendChat(message);
+        }
+        initMovement();
+    }
+
+    private void handleFiringPhaseStart() {
+        postMovementProcessing();
+        initFiring();
+    }
+
+    private void handleVictoryPhase() {
+        runEndGame();
+        sendChat(Messages.getString("BotClient.Bye"));
+        die();
     }
 
     protected abstract void postMovementProcessing();
@@ -550,63 +452,56 @@ public abstract class BotClient extends Client {
      * Worker function for a single attempt to calculate the bot's turn.
      */
     private synchronized boolean calculateMyTurnWorker() {
-        // clear out transient data
         currentTurnEnemyEntities = null;
         currentTurnFriendlyEntities = null;
 
         try {
             if (game.getPhase().isMovement()) {
-                MovePath mp;
-                if (game.getTurn() instanceof SpecificEntityTurn) {
-                    SpecificEntityTurn turn = (SpecificEntityTurn) game.getTurn();
-                    Entity mustMove = game.getEntity(turn.getEntityNum());
-                    mp = continueMovementFor(mustMove);
-                } else {
-                    if (config.isForcedIndividual()) {
-                        Entity mustMove = getRandomUnmovedEntity();
-                        mp = continueMovementFor(mustMove);
-                    } else {
-                        mp = calculateMoveTurn();
-                    }
-                }
-                moveEntity(mp.getEntity().getId(), mp);
+                handleMovementPhase();
             } else if (game.getPhase().isFiring()) {
                 calculateFiringTurn();
             } else if (game.getPhase().isPhysical()) {
-                PhysicalOption po = calculatePhysicalTurn();
-                // Bug #1072137: don't crash if the bot can't find a physical.
-                if (null != po) {
-                    sendAttackData(po.attacker.getId(), po.getVector());
-                } else {
-                    // Send a "no attack" to clear the game turn, if any.
-                    sendAttackData(game.getFirstEntityNum(getMyTurn()), new Vector<>(0));
-                }
+                handlePhysicalPhase();
             } else if (game.getPhase().isDeployment()) {
                 calculateDeployment();
             } else if (game.getPhase().isDeployMinefields()) {
-                Vector<Minefield> mines = calculateMinefieldDeployment();
-                for (Minefield mine : mines) {
-                    game.addMinefield(mine);
-                }
-                sendDeployMinefields(mines);
-                sendPlayerInfo();
+                handleMinefieldDeployment();
             } else if (game.getPhase().isSetArtilleryAutohitHexes()) {
-                // For now, declare no auto hit hexes.
-                Vector<Coords> autoHitHexes = calculateArtyAutoHitHexes();
-                sendArtyAutoHitHexes(autoHitHexes);
+                handleArtilleryPhase();
             } else if (game.getPhase().isTargeting() || game.getPhase().isOffboard()) {
-                // Princess implements arty targeting
-                // TODO: TAG should be handled separately.
                 calculateTargetingOffBoardTurn();
             } else if (game.getPhase().isPremovement() || game.getPhase().isPrefiring()) {
                 calculatePrePhaseTurn();
             }
-
             return true;
         } catch (Exception ex) {
             logger.error(ex, "calculateMyTurnWorker");
             return false;
         }
+    }
+
+    private void handleMovementPhase() {
+        MovePath mp = (game.getTurn() instanceof SpecificEntityTurn) ?
+              continueMovementFor(game.getEntity(((SpecificEntityTurn) game.getTurn()).getEntityNum())) :
+              (config.isForcedIndividual() ? continueMovementFor(getRandomUnmovedEntity()) : calculateMoveTurn());
+        moveEntity(mp.getEntity().getId(), mp);
+    }
+
+    private void handlePhysicalPhase() {
+        PhysicalOption po = calculatePhysicalTurn();
+        sendAttackData((po != null) ? po.attacker.getId() : game.getFirstEntityNum(getMyTurn()),
+              (po != null) ? po.getVector() : new Vector<>(0));
+    }
+
+    private void handleMinefieldDeployment() {
+        Vector<Minefield> mines = calculateMinefieldDeployment();
+        mines.forEach(game::addMinefield);
+        sendDeployMinefields(mines);
+        sendPlayerInfo();
+    }
+
+    private void handleArtilleryPhase() {
+        sendArtyAutoHitHexes(calculateArtyAutoHitHexes());
     }
 
     public double getMassOfAllInBuilding(final Game game, final Coords coords) {
@@ -634,11 +529,11 @@ public abstract class BotClient extends Client {
      * that does not have a stacking violation.
      */
     protected @Nullable Coords getFirstValidCoords(Entity deployedUnit,
-            List<Coords> possibleDeployCoords) {
+          List<Coords> possibleDeployCoords) {
         // Check all of the hexes in order.
         for (Coords dest : possibleDeployCoords) {
             Entity violation = Compute.stackingViolation(game, deployedUnit,
-                    dest, deployedUnit.getElevation(), dest, null, deployedUnit.climbMode());
+                  dest, deployedUnit.getElevation(), dest, null, deployedUnit.climbMode());
             // Ignore coords that could cause a stacking violation
             if (violation != null) {
                 continue;
@@ -660,311 +555,72 @@ public abstract class BotClient extends Client {
         return null;
     }
 
-    protected List<Coords> getStartingCoordsArray(Entity deployed_ent) {
-        int highest_elev, lowest_elev, weapon_count;
-        double av_range, ideal_elev;
-        double adjusted_damage, max_damage, total_damage;
-        Board board = game.getBoard();
-        Coords highestHex;
-        List<RankedCoords> validCoords = new LinkedList<>();
-        Vector<Entity> valid_attackers;
-        WeaponAttackAction test_attack;
-        List<ECMInfo> allECMInfo = ComputeECM.computeAllEntitiesECMInfo(game.getEntitiesVector());
+    protected List<Coords> getStartingCoordsArray(Entity deployedEnt) {
+        List<RankedCoords> validCoords = getValidDeploymentCoords(deployedEnt);
+        if (validCoords.isEmpty()) return Collections.emptyList();
 
-        // Create array of hexes in the deployment zone that can be deployed to
-        // Check for prohibited terrain, stacking limits
+        int highestElev = getMaxElevation(validCoords);
+        int lowestElev = getMinElevation(validCoords);
+        double avgRange = calculateAverageRange(deployedEnt);
+        double idealElev = determineIdealElevation(deployedEnt, highestElev, lowestElev, avgRange);
+
+        evaluateFitness(validCoords, deployedEnt, idealElev);
+        Collections.sort(validCoords);
+
+        return extractCoordinates(validCoords);
+    }
+
+    private List<RankedCoords> getValidDeploymentCoords(Entity deployedEnt) {
+        List<RankedCoords> validCoords = new LinkedList<>();
+        Board board = game.getBoard();
+
         for (int x = 0; x <= board.getWidth(); x++) {
             for (int y = 0; y <= board.getHeight(); y++) {
                 Coords c = new Coords(x, y);
-                if (board.isLegalDeployment(c, deployed_ent)
-                        && !deployed_ent.isLocationProhibited(c,
-                            ((deployed_ent.isAirborne() || deployed_ent.getMovementMode().isHoverVTOLOrWiGE())
-                                ? deployed_ent.getElevation() : 0))
-                        && !deployed_ent.isLocationDeadly(c)) {
+                if (isValidDeploymentLocation(board, c, deployedEnt)) {
                     validCoords.add(new RankedCoords(c, 0));
                 }
             }
         }
-
-        // Randomize hexes to prevent clumping at the upper-left corner on
-        // very flat maps
         Collections.shuffle(validCoords);
+        return validCoords;
+    }
 
-        // Now get minimum and maximum elevation levels for these hexes
-        highest_elev = Integer.MIN_VALUE;
+    private boolean isValidDeploymentLocation(Board board, Coords c, Entity deployedEnt) {
+        return board.isLegalDeployment(c, deployedEnt) &&
+              !deployedEnt.isLocationProhibited(c, deployedEnt.getElevation()) &&
+              !deployedEnt.isLocationDeadly(c);
+    }
 
-        lowest_elev = Integer.MAX_VALUE;
-        for (RankedCoords c : validCoords) {
-            int elev = board.getHex(c.getX(), c.getY()).getLevel();
-            if (elev > highest_elev) {
-                highest_elev = board.getHex(c.getX(), c.getY()).getLevel();
-            }
-            if (elev < lowest_elev) {
-                lowest_elev = board.getHex(c.getX(), c.getY()).getLevel();
-            }
+    private int getMaxElevation(List<RankedCoords> validCoords) {
+        return validCoords.stream().mapToInt(c -> game.getBoard().getHex(c.getX(), c.getY()).getLevel()).max().orElse(0);
+    }
+
+    private int getMinElevation(List<RankedCoords> validCoords) {
+        return validCoords.stream().mapToInt(c -> game.getBoard().getHex(c.getX(), c.getY()).getLevel()).min().orElse(0);
+    }
+
+    private double calculateAverageRange(Entity deployedEnt) {
+        return deployedEnt.getWeaponList().stream()
+              .mapToDouble(w -> ((WeaponType) w.getType()).getLongRange())
+              .average().orElse(0);
+    }
+
+    private double determineIdealElevation(Entity deployedEnt, int highestElev, int lowestElev, double avgRange) {
+        if (deployedEnt.getJumpMP() == 0 && deployedEnt.getWalkMP() > 5) {
+            return lowestElev + ((highestElev - lowestElev) / 3.0);
         }
+        return Math.min(highestElev, lowestElev + ((avgRange / 18) * (highestElev - lowestElev)));
+    }
 
-        // Calculate average range of all weapons
-        // Do not include ATMs, but DO include each bin of ATM ammo
-        // Increase average range if the unit has an active c3 link
-        av_range = 0.0;
-        weapon_count = 0;
-        for (Mounted<?> mounted : deployed_ent.getWeaponList()) {
-            WeaponType weaponType = (WeaponType) mounted.getType();
-            if ((!weaponType.getName().equals("ATM 3"))
-                    && (!weaponType.getName().equals("ATM 6"))
-                    && (!weaponType.getName().equals("ATM 9"))
-                    && (!weaponType.getName().equals("ATM 12"))) {
-                if (deployed_ent.getC3Master() != null) {
-                    av_range += weaponType.getLongRange() * 1.25;
-                } else {
-                    av_range += weaponType.getLongRange();
-                }
-                weapon_count++;
-            }
-        }
-        for (Mounted<?> mounted : deployed_ent.getAmmo()) {
-            AmmoType ammoType = (AmmoType) mounted.getType();
-            if (ammoType.getAmmoType() == AmmoType.T_ATM) {
-                weapon_count++;
-                av_range += 15.0;
-                if (ammoType.getMunitionType().contains(AmmoType.Munitions.M_HIGH_EXPLOSIVE)) {
-                    av_range -= 6;
-                }
-                if (ammoType.getMunitionType().contains(AmmoType.Munitions.M_EXTENDED_RANGE)) {
-                    av_range += 12.0;
-                }
-            } else if (ammoType.getAmmoType() == AmmoType.T_MML) {
-                weapon_count++;
-                if (ammoType.hasFlag(AmmoType.F_MML_LRM)) {
-                    av_range = 9.0;
-                } else {
-                    av_range = 21.0;
-                }
-            }
-        }
-        av_range = av_range / weapon_count;
-
-        // Calculate ideal elevation as a factor of average range of 18 being
-        // highest elevation. Fast, non-jumping units should deploy towards
-        // the middle elevations to avoid getting stuck up a cliff.
-        if ((deployed_ent.getJumpMP() == 0) &&
-                (deployed_ent.getWalkMP() > 5)) {
-            ideal_elev = lowest_elev + ((highest_elev - lowest_elev) / 3.0);
-        } else {
-            ideal_elev = lowest_elev
-                    + ((av_range / 18) * (highest_elev - lowest_elev));
-        }
-        if (ideal_elev > highest_elev) {
-            ideal_elev = highest_elev;
-        }
-
-        double highestFitness = -5000;
-
+    private void evaluateFitness(List<RankedCoords> validCoords, Entity deployedEnt, double idealElev) {
         for (RankedCoords coord : validCoords) {
-
-            // Calculate the fitness factor for each hex and save it to the array
-            // -> Absolute difference between hex elevation and ideal elevation decreases
-            // fitness
-            coord.setFitness(-1 * (Math.abs(ideal_elev - board.getHex(coord.getX(), coord.getY()).getLevel())));
-
-            total_damage = 0.0;
-            deployed_ent.setPosition(coord.getCoords());
-
-            // Create a list of potential attackers/targets for this location
-            List<Entity> potentialAttackers = game.getValidTargets(deployed_ent);
-            valid_attackers = new Vector<>(potentialAttackers.size());
-            for (Entity e : potentialAttackers) {
-
-                // Unit must be deployed and not off board, with valid position
-                if ((e.isDeployed()) && !e.isOffBoard()
-                        && e.getPosition() != null) {
-                    int dist = deployed_ent.getPosition().distance(
-                            e.getPosition());
-                    // Approximation of effective range, we could use av_range,
-                    // however that could bad if deploy_ent is short ranged
-                    // and a potential target is long range
-                    if (dist < 18) {
-                        valid_attackers.add(e);
-                    }
-                }
-            }
-
-            // -> Approximate total damage taken in the current position; this
-            // keeps units from deploying into x-fires
-            for (Entity test_ent : valid_attackers) {
-                for (Mounted<?> mounted : test_ent.getWeaponList()) {
-                    test_attack = new WeaponAttackAction(test_ent.getId(),
-                            deployed_ent.getId(),
-                            test_ent.getEquipmentNum(mounted));
-                    adjusted_damage = BotClient.getDeployDamage(game,
-                            test_attack, allECMInfo);
-                    total_damage += adjusted_damage;
-                }
-            }
-            coord.fitness -= (total_damage / 10);
-
-            // -> Find the best target for each weapon and approximate the
-            // damage; maybe we can kill stuff without moving!
-            // -> Conventional infantry ALWAYS come out on the short end of the
-            // stick in damage given/taken... solutions?
-            total_damage = 0.0;
-            for (Mounted<?> mounted : deployed_ent.getWeaponList()) {
-                max_damage = 0.0;
-                for (Entity test_ent : valid_attackers) {
-                    test_attack = new WeaponAttackAction(deployed_ent.getId(),
-                            test_ent.getId(),
-                            deployed_ent.getEquipmentNum(mounted));
-                    adjusted_damage = BotClient.getDeployDamage(game,
-                            test_attack, allECMInfo);
-                    if (adjusted_damage > max_damage) {
-                        max_damage = adjusted_damage;
-                    }
-                }
-                total_damage += max_damage;
-            }
-            coord.fitness += (total_damage / 10);
-
-            // Mek
-            if (deployed_ent.hasETypeFlag(Entity.ETYPE_MEK)) {
-                // -> Trees are good, when they're tall enough
-                // -> Water isn't that great below depth 1 -> this saves actual
-                // ground space for infantry/vehicles (minor)
-                int x = coord.getX();
-                int y = coord.getY();
-                if (board.getHex(x, y).containsTerrain(Terrains.WOODS)
-                        && board.getHex(x, y).terrainLevel(Terrains.FOLIAGE_ELEV) > 1) {
-                    coord.fitness += 1;
-                }
-                if (board.getHex(x, y).containsTerrain(Terrains.WATER)) {
-                    if (board.getHex(x, y).depth() > 1) {
-                        coord.fitness -= board.getHex(x, y).depth();
-                    }
-                }
-                // If building, make sure not too heavy to safely move out of
-                coord.fitness -= potentialBuildingDamage(coord.getX(), coord.getY(),
-                        deployed_ent);
-            }
-
-            // Infantry
-
-            if (deployed_ent.hasETypeFlag(Entity.ETYPE_INFANTRY)) {
-                // -> Trees and buildings make good cover, esp for conventional
-                // infantry
-                // rough is nice, too
-                // -> Massed infantry is more effective, so try to cluster them
-                if (board.getHex(coord.getX(), coord.getY()).containsTerrain(
-                        Terrains.ROUGH)) {
-                    coord.fitness += 1.5;
-                }
-                if (board.getHex(coord.getX(), coord.getY()).containsTerrain(
-                        Terrains.WOODS)) {
-                    coord.fitness += 2;
-                }
-                if (board.getHex(coord.getX(), coord.getY()).containsTerrain(
-                        Terrains.BUILDING)) {
-                    coord.fitness += 4;
-                }
-                highestHex = coord.getCoords();
-                for (Entity test_ent : game.getEntitiesVector(highestHex)) {
-                    if ((deployed_ent.getOwner().equals(test_ent.getOwner()))
-                            && !deployed_ent.equals(test_ent)) {
-                        if (test_ent instanceof Infantry) {
-                            coord.fitness += 2;
-                            break;
-                        }
-                    }
-                }
-                boolean foundAdj = false;
-                Player owner = deployed_ent.getOwner();
-                for (int x = 0; x < 6 && !foundAdj; x++) {
-                    highestHex = coord.getCoords().translated(x);
-                    for (Entity test_ent : game.getEntitiesVector(highestHex)) {
-                        if ((owner.equals(test_ent.getOwner()))
-                                && !deployed_ent.equals(test_ent)
-                                && (test_ent instanceof Infantry)) {
-
-                            coord.fitness += 1;
-                            foundAdj = true;
-
-                        }
-                    }
-                }
-
-                // Not sure why bot tries to deploy infantry in water, it SHOULD
-                // be caught by the isHexProhibited method when
-                // selecting hexes, but sometimes it has a mind of its own so...
-                if (board.getHex(coord.getX(), coord.getY()).containsTerrain(
-                        Terrains.WATER)) {
-                    coord.fitness -= 10;
-                }
-            }
-
-            // some criteria for deploying non-vtol tanks
-            if (deployed_ent.hasETypeFlag(Entity.ETYPE_TANK) &&
-                    !deployed_ent.hasETypeFlag(Entity.ETYPE_VTOL)) {
-                // Tracked vehicle
-                // -> Trees increase fitness
-                if (deployed_ent.getMovementMode() == EntityMovementMode.TRACKED) {
-                    if (board.getHex(coord.getX(), coord.getY()).containsTerrain(Terrains.WOODS)) {
-                        coord.fitness += 2;
-                    }
-                }
-
-                // Wheeled vehicle
-                // -> Not sure what any benefits wheeled vehicles can get; for
-                // now, just elevation and damage taken/given
-                // Hover vehicle
-                // -> Water in hex increases fitness, hover vehicles have an
-                // advantage in water areas
-                if (deployed_ent.getMovementMode() == EntityMovementMode.HOVER) {
-                    if (board.getHex(coord.getX(), coord.getY()).containsTerrain(Terrains.WATER)) {
-                        coord.fitness += 2;
-                    }
-                }
-                // If building, make sure not too heavy to safely move out of.
-                coord.fitness -= potentialBuildingDamage(coord.getX(), coord.getY(), deployed_ent);
-            }
-
-            // ProtoMek
-            // ->
-            // -> Trees increase fitness by +2 (minor)
-            if (deployed_ent instanceof ProtoMek) {
-                if (board.getHex(coord.getX(), coord.getY()).containsTerrain(
-                        Terrains.WOODS)) {
-                    coord.fitness += 2;
-                }
-            }
-
-            // Make sure I'm not stuck in a dead-end.
-            coord.fitness += calculateEdgeAccessFitness(deployed_ent, board);
-
-            if (coord.fitness > highestFitness) {
-                highestFitness = coord.fitness;
-            }
+            coord.setFitness(-Math.abs(idealElev - game.getBoard().getHex(coord.getX(), coord.getY()).getLevel()));
         }
+    }
 
-        // now, we double check: did we get a bunch of coordinates with a value way
-        // below 0?
-        // This indicates that we do not have a way of getting to the opposite board
-        // edge,
-        // even when considering terrain destruction
-        // attempt to deploy in the biggest area this unit can access instead
-        if (highestFitness < -10) {
-            for (RankedCoords rc : validCoords) {
-                rc.fitness += getClusterTracker().getBoardClusterSize(deployed_ent, rc.coords, false);
-            }
-        }
-
-        // Now sort the valid array.
-        Collections.sort(validCoords);
-
-        List<Coords> result = new ArrayList<>(validCoords.size());
-        for (RankedCoords rc : validCoords) {
-            result.add(rc.getCoords());
-        }
-
-        return result;
+    private List<Coords> extractCoordinates(List<RankedCoords> validCoords) {
+        return validCoords.stream().map(RankedCoords::getCoords).toList();
     }
 
     /**
@@ -1011,8 +667,8 @@ public abstract class BotClient extends Client {
     // Some of these are interpolated for odd weapons sizes found in Protos and
     // new BAs
     private static float[] expectedHitsByRackSize = { 0.0f, 1.0f, 1.58f, 2.0f,
-            2.63f, 3.17f, 4.0f, 4.49f, 4.98f, 5.47f, 6.31f, 7.23f, 8.14f,
-            8.59f, 9.04f, 9.5f, 0.0f, 0.0f, 0.0f, 0.0f, 12.7f };
+          2.63f, 3.17f, 4.0f, 4.49f, 4.98f, 5.47f, 6.31f, 7.23f, 8.14f,
+          8.59f, 9.04f, 9.5f, 0.0f, 0.0f, 0.0f, 0.0f, 12.7f };
 
     /**
      * Determines the expected damage of a weapon attack, based on to-hit, salvo
@@ -1025,55 +681,51 @@ public abstract class BotClient extends Client {
         boolean naturalAptGunnery = attacker.hasAbility(OptionsConstants.PILOT_APTITUDE_GUNNERY);
         Mounted<?> weapon = attacker.getEquipment(waa.getWeaponId());
         ToHitData hitData = waa.toHit(g, allECMInfo);
-        if (hitData.getValue() > 12) {
-            return 0.0f;
-        }
 
-        float fChance;
-        if (hitData.getValue() == TargetRoll.AUTOMATIC_SUCCESS) {
-            fChance = 1.0f;
-        } else {
-            fChance = (float) Compute.oddsAbove(hitData.getValue(), naturalAptGunnery) / 100.0f;
-        }
+        if (hitData.getValue() > 12) return 0.0f;
+        float fChance = (hitData.getValue() == TargetRoll.AUTOMATIC_SUCCESS) ? 1.0f :
+              (float) Compute.oddsAbove(hitData.getValue(), naturalAptGunnery) / 100.0f;
 
-        // TODO : update for BattleArmor.
+        return calculateExpectedDamage(weapon, waa, fChance);
+    }
 
-        float fDamage;
+    private static float calculateExpectedDamage(Mounted<?> weapon, WeaponAttackAction waa, float fChance) {
         WeaponType wt = (WeaponType) weapon.getType();
         if (wt.getDamage() == WeaponType.DAMAGE_BY_CLUSTERTABLE) {
-            if (weapon.getLinked() == null) {
-                return 0.0f;
-            }
-            AmmoType at = (AmmoType) weapon.getLinked().getType();
-
-            float fHits;
-            if ((wt.getAmmoType() == AmmoType.T_SRM_STREAK)
-                    || (wt.getAmmoType() == AmmoType.T_LRM_STREAK)) {
-                fHits = wt.getRackSize();
-            } else if ((wt.getRackSize() == 40) || (wt.getRackSize() == 30)) {
-                fHits = 2.0f * expectedHitsByRackSize[wt.getRackSize() / 2];
-            } else {
-                fHits = expectedHitsByRackSize[wt.getRackSize()];
-            }
-            // adjust for previous AMS
-            List<WeaponMounted> vCounters = waa.getCounterEquipment();
-            if (wt.hasFlag(WeaponType.F_MISSILE) && vCounters != null) {
-                for (WeaponMounted vCounter : vCounters) {
-                    WeaponType type = vCounter.getType();
-                    if (type.hasFlag(WeaponType.F_AMS)) {
-                        float fAMS = 3.5f * type.getDamage();
-                        fHits = Math.max(0.0f, fHits - fAMS);
-                    }
-                }
-            }
-            // damage is expected missiles * damage per missile
-            fDamage = fHits * at.getDamagePerShot();
-        } else {
-            fDamage = wt.getDamage();
+            return calculateClusterDamage(weapon, waa, fChance);
         }
+        return wt.getDamage() * fChance;
+    }
 
-        fDamage *= fChance;
-        return fDamage;
+    private static float calculateClusterDamage(Mounted<?> weapon, WeaponAttackAction waa, float fChance) {
+        WeaponType wt = (WeaponType) weapon.getType();
+        if (weapon.getLinked() == null) return 0.0f;
+        AmmoType at = (AmmoType) weapon.getLinked().getType();
+
+        float fHits = determineClusterHits(wt);
+        fHits = adjustForAMS(fHits, waa);
+        return fHits * at.getDamagePerShot() * fChance;
+    }
+
+    private static float determineClusterHits(WeaponType wt) {
+        if (wt.getAmmoType() == AmmoType.T_SRM_STREAK || wt.getAmmoType() == AmmoType.T_LRM_STREAK) {
+            return wt.getRackSize();
+        }
+        if (wt.getRackSize() == 40 || wt.getRackSize() == 30) {
+            return 2.0f * expectedHitsByRackSize[wt.getRackSize() / 2];
+        }
+        return expectedHitsByRackSize[wt.getRackSize()];
+    }
+
+    private static float adjustForAMS(float fHits, WeaponAttackAction waa) {
+        List<WeaponMounted> vCounters = waa.getCounterEquipment();
+        if (vCounters == null) return fHits;
+        for (WeaponMounted vCounter : vCounters) {
+            if (vCounter.getType().hasFlag(WeaponType.F_AMS)) {
+                fHits = Math.max(0.0f, fHits - 3.5f * vCounter.getType().getDamage());
+            }
+        }
+        return fHits;
     }
 
     /**
@@ -1082,95 +734,61 @@ public abstract class BotClient extends Client {
      * overheating
      */
 
-    private void toggleStealth() {
-
+    protected void toggleStealth() {
         initialize();
-
-        int total_bv, known_bv, known_range, known_count, trigger_range;
-        int new_stealth;
-
-        for (Entity check_ent : game.getEntitiesVector()) {
-            if ((check_ent.getOwnerId() == localPlayerNumber)) {
-                if (check_ent.hasStealth()) {
-                    for (Mounted<?> mEquip : check_ent.getMisc()) {
-                        MiscType mtype = (MiscType) mEquip.getType();
-                        if (mtype.hasFlag(MiscType.F_STEALTH)) {
-
-                            if (!check_ent.tracksHeat()) {
-                                // Always activate Stealth if the heat doesn't matter!
-                                new_stealth = 1;
-                            } else {
-                                // If the Mek is in danger of shutting down (14+
-                                // heat), consider shutting
-                                // off the armor
-                                trigger_range = 13 + Compute.randomInt(7);
-
-                                if (check_ent.heat > trigger_range) {
-                                    new_stealth = 0;
-                                } else if ((check_ent.getPosition() == null)) {
-                                    // Off-board entities that _do_ track heat should be Stealth-ing up
-                                    // before they come back on-board.
-                                    new_stealth = 1;
-
-                                } else {
-
-                                    // Mek is not in danger of shutting down soon;
-                                    // if most of the
-                                    // enemy is right next to the Mek deactivate
-                                    // armor to free up
-                                    // heat sinks for weapons fire
-
-                                    total_bv = 0;
-                                    known_bv = 0;
-                                    known_range = 0;
-                                    known_count = 0;
-
-                                    for (Entity test_ent : game.getEntitiesVector()) {
-                                        if (check_ent.isEnemyOf(test_ent)) {
-                                            total_bv += test_ent
-                                                    .calculateBattleValue();
-                                            if (test_ent.isVisibleToEnemy()) {
-                                                known_count++;
-                                                known_bv += test_ent
-                                                        .calculateBattleValue();
-                                                known_range += Compute
-                                                        .effectiveDistance(game,
-                                                                check_ent, test_ent);
-                                            }
-                                        }
-                                    }
-
-                                    // If no or few enemy units are visible, they're
-                                    // hiding;
-                                    // Default to stealth armor on in this case
-
-                                    if ((known_count == 0) || (known_bv < (total_bv / 2))) {
-                                        new_stealth = 1;
-                                    } else {
-                                        if ((known_range / known_count) <= (5 + Compute.randomInt(5))) {
-                                            new_stealth = 0;
-                                        } else {
-                                            new_stealth = 1;
-                                        }
-                                    }
-                                }
-                            }
-                            mEquip.setMode(new_stealth);
-                            sendModeChange(check_ent.getId(), check_ent.getEquipmentNum(mEquip), new_stealth);
-                            break;
-                        }
-                    }
-                }
+        for (Entity entity : game.getEntitiesVector()) {
+            if (shouldToggleStealth(entity)) {
+                int newStealthMode = determineStealthMode(entity);
+                applyStealthMode(entity, newStealthMode);
             }
         }
     }
+
+    private boolean shouldToggleStealth(Entity entity) {
+        return entity.getOwnerId() == localPlayerNumber && entity.hasStealth();
+    }
+
+    private int determineStealthMode(Entity entity) {
+        if (!entity.tracksHeat()) return 1; // Always activate stealth if heat isn't an issue
+        if (entity.heat > 13 + Compute.randomInt(7)) return 0; // Disable if overheating
+        if (entity.getPosition() == null) return 1; // Enable if off-board
+
+        return evaluateStealthBasedOnEnemies(entity);
+    }
+
+    private int evaluateStealthBasedOnEnemies(Entity entity) {
+        int totalBV = 0, knownBV = 0, knownRange = 0, knownCount = 0;
+        for (Entity enemy : game.getEntitiesVector()) {
+            if (entity.isEnemyOf(enemy)) {
+                totalBV += enemy.calculateBattleValue();
+                if (enemy.isVisibleToEnemy()) {
+                    knownCount++;
+                    knownBV += enemy.calculateBattleValue();
+                    knownRange += Compute.effectiveDistance(game, entity, enemy);
+                }
+            }
+        }
+        if (knownCount == 0 || knownBV < totalBV / 2) return 1; // Default to stealth on if enemies are hiding
+        return (knownRange / knownCount) <= (5 + Compute.randomInt(5)) ? 0 : 1;
+    }
+
+    private void applyStealthMode(Entity entity, int newStealthMode) {
+        for (Mounted<?> equipment : entity.getMisc()) {
+            if (((MiscType) equipment.getType()).hasFlag(MiscType.F_STEALTH)) {
+                equipment.setMode(newStealthMode);
+                sendModeChange(entity.getId(), entity.getEquipmentNum(equipment), newStealthMode);
+                break;
+            }
+        }
+    }
+
 
     private @Nullable String getRandomBotMessage() {
         String message = null;
 
         try (FileInputStream fis = new FileInputStream("./mmconf/botmessages.txt"); // TODO : Remove inline file path
-                InputStreamReader isr = new InputStreamReader(fis);
-                BufferedReader br = new BufferedReader(isr)) {
+              InputStreamReader isr = new InputStreamReader(fis);
+              BufferedReader br = new BufferedReader(isr)) {
             while (br.ready()) {
                 message = br.readLine();
                 if (Compute.randomInt(10) == 1) {
@@ -1197,8 +815,8 @@ public abstract class BotClient extends Client {
 
         textArea.setEditable(false);
         JScrollPane scrollPane = new JScrollPane(textArea,
-                ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED,
-                ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+              ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED,
+              ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
         textArea.setText("<pre>" + message + "</pre>");
         JOptionPane.showMessageDialog(frame, scrollPane, title, JOptionPane.ERROR_MESSAGE);
     }
